@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+#  .dockerignore  ::  Reduce el contexto de build (velocidad + superficie de
+#  ataque). Todo lo excluido aqui jamas llega al daemon ni a las capas.
+# ---------------------------------------------------------------------------
+
+# Artefactos de compilacion: se regeneran dentro del builder.
+target/
+build/
+out/
+
+# Metadatos de control de versiones.
+.git/
+.gitignore
+.gitattributes
+
+# Entornos locales y secretos.
+.env
+.env.*
+*.pem
+*.key
+
+# IDE / editor.
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Documentacion y reportes locales.
+*.md
+docs/
+!FORENSIC_REPORT.md
+
+# Logs y dumps locales.
+*.log
+*.hprof
+logs/
+
+# Sistema operativo.
+.DS_Store
+Thumbs.db

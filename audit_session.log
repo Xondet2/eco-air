@@ -1,0 +1,952 @@
+Script iniciado en 2026-10-20 16:35:32-05:00 [COMMAND="bash /tmp/audit_session.sh" <no ejecutado en terminal>]
+
+===============================================================================
+  0 - PREFLIGHT DEL ENTORNO DE AUDITORIA
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ date --iso-8601=seconds
+2026-10-20T16:36:14-05:00
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ uname -a
+Linux ubuntu 6.8.0-139-generic #139-Ubuntu SMP PREEMPT_DYNAMIC Sat Aug  1 03:52:05 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker version --format 'Client:{{.Client.Version}} Server:{{.Server.Version}}'
+Client:29.9.0 Server:29.8.2
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker info --format 'Kernel={{.KernelVersion}} Storage={{.Driver}} Cgroup={{.CgroupVersion}}/{{.CgroupDriver}} CPUs={{.NCPU}} MemTotal={{.MemTotal}}'
+Kernel=7.0.14-linuxkit Storage=overlayfs Cgroup=2/cgroupfs CPUs=4 MemTotal=1961537536
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ nproc
+4
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ uptime
+ 16:36:15 up  4:29,  1 user,  load average: 6.38, 2.98, 3.05
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ cat /proc/loadavg
+6.38 2.98 3.05 4/1688 247149
+[exit=0]
+
+===============================================================================
+  RETO 1 - CONSTRUCCION MULTIETAPA CON INYECCION DE STUDENT_ID
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ cat Dockerfile
+# =============================================================================
+#  eco-air-backend  ::  Imagen de produccion multietapa
+#  Objetivo: artefacto ligero, ejecucion sin privilegios y cuotas de hardware.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  ETAPA 1 (builder): compilacion con el toolchain completo de Maven.
+#  Esta etapa NUNCA llega a produccion: aporta unicamente el .jar final.
+# -----------------------------------------------------------------------------
+FROM maven:3.9.6-eclipse-temurin-17-alpine AS builder
+
+# Identificador del estudiante inyectado en tiempo de construccion.
+ARG STUDENT_ID
+
+LABEL stage="builder" \
+      student.id="${STUDENT_ID}"
+
+WORKDIR /build
+
+# (1) Aislamiento del POM: al copiar SOLO el pom.xml, la capa de dependencias
+#     queda cacheada y se reutiliza mientras el pom.xml no cambie.
+COPY pom.xml .
+
+# (2) Descarga anticipada de dependencias en modo batch para preservar cache
+#     entre builds de codigo fuente.
+RUN mvn -B dependency:go-offline
+
+# (3) Transferencia del codigo fuente y empaquetado omitiendo pruebas.
+COPY src ./src
+RUN mvn -B clean package -DskipTests
+
+# -----------------------------------------------------------------------------
+#  ETAPA 2 (runtime): JRE minimo, usuario sin privilegios y cuotas declaradas.
+# -----------------------------------------------------------------------------
+FROM eclipse-temurin:17-jre-alpine
+
+# El ARG debe redeclararse en esta etapa para poder inyectarlo en el ENV final.
+ARG STUDENT_ID
+
+LABEL org.opencontainers.image.title="eco-air-backend" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.description="Procesamiento de alertas ambientales criticas" \
+      student.id="${STUDENT_ID}"
+
+# Usuario y grupo de sistema SIN privilegios (UID 10001 / grupo sensorgroup).
+RUN addgroup -S -g 10001 sensorgroup \
+ && adduser  -S -u 10001 -G sensorgroup -s /sbin/nologin -H sensor_user
+
+WORKDIR /app
+
+# Copia UNICAMENTE del artefacto resultante desde la etapa builder.
+COPY --from=builder /build/target/eco-air-backend.jar /app/eco-air-backend.jar
+
+# (4) AppCDS (Class Data Sharing): se entrena el cargador de clases DENTRO de
+#     la propia imagen, de modo que en runtime las clases de Spring/Hibernate
+#     se mapeen desde disco en vez de parsearse y verificarse en cada arranque.
+#     Es lo que permite cumplir el SLA de arranque (< 15 s) en una caja lenta.
+ENV CDS_ARCHIVE=/app/eco-air-backend.jsa
+RUN set -eux; \
+    java -XX:ArchiveClassesAtExit="${CDS_ARCHIVE}" \
+         -XX:TieredStopAtLevel=1 \
+         -XX:+UseSerialGC \
+         -Dspring.context.exit=onRefresh \
+         -jar /app/eco-air-backend.jar; \
+    test -s "${CDS_ARCHIVE}"; \
+    ls -lh /app
+
+# La titularidad del directorio de trabajo pasa al usuario sin privilegios.
+RUN chown -R sensor_user:sensorgroup /app
+
+# (5) Variables de entorno ergonomicas para la JVM en contenedor:
+#     - UseContainerSupport + MaxRAMPercentage: la JVM deriva el heap del
+#       limite de cgroups en lugar del total del host. Asi NUNCA acapara la
+#       RAM de la estacion meteorologica aunque el host tenga mucha memoria.
+#     - InitialRAMPercentage: reserva temprana controlada.
+#     - TieredStopAtLevel=1 + SerialGC: en una estacion remota con 1-2 vCPU el
+#       JIT C2 y el GC paralelo cuestan mas de lo que aportan; se recorta el
+#       tiempo de arranque sin perder funcionalidad.
+#     - SharedArchiveFile: consume el archivo AppCDS generado arriba.
+#     - HeapDumpOnOutOfMemoryError: trazabilidad forense ante asfixia de memoria.
+ENV JAVA_OPTS="-XX:+UseContainerSupport \
+-XX:MaxRAMPercentage=75.0 \
+-XX:InitialRAMPercentage=25.0 \
+-XX:TieredStopAtLevel=1 \
+-XX:+UseSerialGC \
+-XX:SharedArchiveFile=/app/eco-air-backend.jsa \
+-XX:+HeapDumpOnOutOfMemoryError \
+-XX:HeapDumpPath=/tmp/eco-air-oom.hprof \
+-Djava.security.egd=file:/dev/./urandom \
+-Dspring.output.ansi.enabled=NEVER"
+
+# (6) Trazabilidad del operador que construyo la imagen.
+ENV OPERATOR_ID=${STUDENT_ID}
+
+EXPOSE 8080
+
+# (7) Descenso de privilegios ANTES del ENTRYPOINT.
+USER sensor_user
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/eco-air-backend.jar"]
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ cat .dockerignore
+# ---------------------------------------------------------------------------
+#  .dockerignore  ::  Reduce el contexto de build (velocidad + superficie de
+#  ataque). Todo lo excluido aqui jamas llega al daemon ni a las capas.
+# ---------------------------------------------------------------------------
+
+# Artefactos de compilacion: se regeneran dentro del builder.
+target/
+build/
+out/
+
+# Metadatos de control de versiones.
+.git/
+.gitignore
+.gitattributes
+
+# Entornos locales y secretos.
+.env
+.env.*
+*.pem
+*.key
+
+# IDE / editor.
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Documentacion y reportes locales.
+*.md
+docs/
+!FORENSIC_REPORT.md
+
+# Logs y dumps locales.
+*.log
+*.hprof
+logs/
+
+# Sistema operativo.
+.DS_Store
+Thumbs.db
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker build --build-arg STUDENT_ID="898780" -t eco-air-backend:1.0.0 .
+[1A[1B[0G[?25l
+[?25h[1A[0G[?25l
+[?25h[1A[0G[?25l[+] Building 0.0s (0/1)                                    docker:desktop-linux
+[?25h[1A[0G[?25l[+] Building 0.2s (1/1)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m[?25h[1A[1A[1A[0G[?25l[+] Building 0.4s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  0.2s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  0.2s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 0.5s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  0.3s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  0.3s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 0.7s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  0.5s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  0.5s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 0.8s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  0.6s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  0.6s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.0s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  0.8s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  0.8s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.1s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  0.9s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  0.9s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.3s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  1.1s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  1.1s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.4s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  1.2s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  1.2s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.6s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  1.4s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  1.4s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.7s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  1.5s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  1.5s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 1.9s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  1.7s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  1.7s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.0s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  1.8s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  1.8s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.2s (1/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  2.0s
+ => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.2s (2/3)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m[34m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  2.0s
+[0m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[?25h[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.4s (4/4)                                    docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m[34m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  2.0s
+[0m[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.5s (5/17)                                   docker:desktop-linux
+[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.1s
+ => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.0s
+[34m => [internal] load build context                                          0.0s
+[0m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.1s
+ => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.0s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.7s (5/17)                                   docker:desktop-linux
+[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.2s
+ => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.2s
+[34m => [internal] load build context                                          0.0s
+[0m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.2s
+ => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.2s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 2.8s (5/17)                                   docker:desktop-linux
+[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.4s
+ => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.3s
+[34m => [internal] load build context                                          0.0s
+[0m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.4s
+ => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.3s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.0s (5/17)                                   docker:desktop-linux
+[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.5s
+ => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.5s
+[34m => [internal] load build context                                          0.0s
+[0m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.5s
+ => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.5s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.1s (6/17)                                   docker:desktop-linux
+[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.6s
+ => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.5s
+[34m => [internal] load build context                                          0.0s
+[0m[34m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.6s
+[0m[34m => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.6s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.2s (6/17)                                   docker:desktop-linux
+[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m[34m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.7s
+[0m[34m => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.6s
+[0m => [internal] load build context                                          0.0s
+ => => transferring context: 27B                                           0.0s
+[34m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.6s
+[0m[34m => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.6s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.3s (7/17)                                   docker:desktop-linux
+[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m[34m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.7s
+[0m[34m => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.6s
+[0m[34m => [internal] load build context                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m[34m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.6s
+[0m[34m => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.6s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.4s (17/18)                                  docker:desktop-linux
+[34m => CACHED [builder 4/6] RUN mvn -B dependency:go-offline                  0.0s
+[0m[34m => CACHED [builder 5/6] COPY src ./src                                    0.0s
+[0m[34m => CACHED [builder 6/6] RUN mvn -B clean package -DskipTests              0.0s
+[0m[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.0s
+ => => exporting layers                                                    0.0s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.5s (17/18)                                  docker:desktop-linux
+[34m => CACHED [builder 6/6] RUN mvn -B clean package -DskipTests              0.0s
+[0m[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.1s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.7s (17/18)                                  docker:desktop-linux
+[34m => CACHED [builder 6/6] RUN mvn -B clean package -DskipTests              0.0s
+[0m[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.3s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 3.8s (17/18)                                  docker:desktop-linux
+[34m => CACHED [builder 6/6] RUN mvn -B clean package -DskipTests              0.0s
+[0m[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.4s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.0s (17/18)                                  docker:desktop-linux
+[34m => CACHED [builder 6/6] RUN mvn -B clean package -DskipTests              0.0s
+[0m[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.6s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.0s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.6s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.0s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.2s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.8s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.2s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.3s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     0.9s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.3s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.5s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.1s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.5s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.6s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.2s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.6s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.7s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.3s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.0s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 4.9s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.5s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.2s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.0s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.6s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.3s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.2s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.8s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.3s (17/18)                                  docker:desktop-linux
+[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m => exporting to image                                                     1.9s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.4s (17/18)                                  docker:desktop-linux
+ => exporting to image                                                     2.0s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.6s (17/18)                                  docker:desktop-linux
+ => exporting to image                                                     2.2s
+[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.6s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.7s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 5.9s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.0s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.2s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.3s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.5s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.6s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.8s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 6.9s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 7.1s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 7.2s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 7.4s (18/18)                                  docker:desktop-linux
+[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[1A[1A[1A[1A[1A[1A[1A[1A[1A[0G[?25l[+] Building 7.5s (18/18) FINISHED                         docker:desktop-linux
+[34m => [internal] load build definition from Dockerfile                       0.2s
+[0m[34m => => transferring dockerfile: 4.29kB                                     0.0s
+[0m[34m => [internal] load metadata for docker.io/library/maven:3.9.6-eclipse-te  2.0s
+[0m[34m => [internal] load metadata for docker.io/library/eclipse-temurin:17-jre  2.0s
+[0m[34m => [internal] load .dockerignore                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m[34m => [builder 1/6] FROM docker.io/library/maven:3.9.6-eclipse-temurin-17-a  0.7s
+[0m[34m => => resolve docker.io/library/maven:3.9.6-eclipse-temurin-17-alpine@sh  0.6s
+[0m[34m => [internal] load build context                                          0.2s
+[0m[34m => => transferring context: 759B                                          0.0s
+[0m[34m => [stage-1 1/6] FROM docker.io/library/eclipse-temurin:17-jre-alpine@sh  0.6s
+[0m[34m => => resolve docker.io/library/eclipse-temurin:17-jre-alpine@sha256:3c4  0.6s
+[0m[34m => CACHED [stage-1 2/6] RUN addgroup -S -g 10001 sensorgroup  && adduser  0.0s
+[0m[34m => CACHED [stage-1 3/6] WORKDIR /app                                      0.0s
+[0m[34m => CACHED [builder 2/6] WORKDIR /build                                    0.0s
+[0m[34m => CACHED [builder 3/6] COPY pom.xml .                                    0.0s
+[0m[34m => CACHED [builder 4/6] RUN mvn -B dependency:go-offline                  0.0s
+[0m[34m => CACHED [builder 5/6] COPY src ./src                                    0.0s
+[0m[34m => CACHED [builder 6/6] RUN mvn -B clean package -DskipTests              0.0s
+[0m[34m => CACHED [stage-1 4/6] COPY --from=builder /build/target/eco-air-backen  0.0s
+[0m[34m => CACHED [stage-1 5/6] RUN set -eux;     java -XX:ArchiveClassesAtExit=  0.0s
+[0m[34m => CACHED [stage-1 6/6] RUN chown -R sensor_user:sensorgroup /app         0.0s
+[0m[34m => exporting to image                                                     2.2s
+[0m[34m => => exporting layers                                                    0.0s
+[0m[34m => => exporting manifest sha256:04cef53811f79bcda073f93652e97592c869c700  0.1s
+[0m[34m => => exporting config sha256:20d70897315c245791619c61847920ecd7535a4824  0.1s
+[0m[34m => => exporting attestation manifest sha256:6471bd118bad4a6e9e943947b097  0.7s
+[0m[34m => => exporting manifest list sha256:624afe985bc234de83b6d13a7b2e6889d65  0.5s
+[0m[34m => => naming to docker.io/library/eco-air-backend:1.0.0                   0.0s
+[0m[34m => => unpacking to docker.io/library/eco-air-backend:1.0.0                0.1s
+[0m[?25h[exit=0]
+
+===============================================================================
+  RETO 1 - IDENTIDAD DE LA IMAGEN (UUID del daemon y firmas SHA-256)
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker images eco-air-backend:1.0.0
+[39m[1mIMAGE[0m               
+[34m[1meco-air-backend:1.0.0[0m
+                    
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker image inspect --format='{{json .Config.Labels}}' eco-air-backend:1.0.0
+{"org.opencontainers.image.description":"Procesamiento de alertas ambientales criticas","org.opencontainers.image.title":"eco-air-backend","org.opencontainers.image.version":"1.0.0","student.id":"898780"}
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker image inspect --format='{{json .Config.Env}}' eco-air-backend:1.0.0
+["PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","JAVA_HOME=/opt/java/openjdk","LANG=en_US.UTF-8","LANGUAGE=en_US:en","LC_ALL=en_US.UTF-8","JAVA_VERSION=jdk-17.0.20.1+1","CDS_ARCHIVE=/app/eco-air-backend.jsa","JAVA_OPTS=-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:InitialRAMPercentage=25.0 -XX:TieredStopAtLevel=1 -XX:+UseSerialGC -XX:SharedArchiveFile=/app/eco-air-backend.jsa -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/eco-air-oom.hprof -Djava.security.egd=file:/dev/./urandom -Dspring.output.ansi.enabled=NEVER","OPERATOR_ID=898780"]
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker history --no-trunc --format '{{.CreatedBy}}' eco-air-backend:1.0.0 | head -20
+ENTRYPOINT ["sh" "-c" "exec java $JAVA_OPTS -jar /app/eco-air-backend.jar"]
+USER sensor_user
+EXPOSE [8080/tcp]
+ENV OPERATOR_ID=898780
+ENV JAVA_OPTS=-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:InitialRAMPercentage=25.0 -XX:TieredStopAtLevel=1 -XX:+UseSerialGC -XX:SharedArchiveFile=/app/eco-air-backend.jsa -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/eco-air-oom.hprof -Djava.security.egd=file:/dev/./urandom -Dspring.output.ansi.enabled=NEVER
+RUN |1 STUDENT_ID=898780 /bin/sh -c chown -R sensor_user:sensorgroup /app # buildkit
+RUN |1 STUDENT_ID=898780 /bin/sh -c set -eux;     java -XX:ArchiveClassesAtExit="${CDS_ARCHIVE}"          -XX:TieredStopAtLevel=1          -XX:+UseSerialGC          -Dspring.context.exit=onRefresh          -jar /app/eco-air-backend.jar;     test -s "${CDS_ARCHIVE}";     ls -lh /app # buildkit
+ENV CDS_ARCHIVE=/app/eco-air-backend.jsa
+COPY /build/target/eco-air-backend.jar /app/eco-air-backend.jar # buildkit
+WORKDIR /app
+RUN |1 STUDENT_ID=898780 /bin/sh -c addgroup -S -g 10001 sensorgroup  && adduser  -S -u 10001 -G sensorgroup -s /sbin/nologin -H sensor_user # buildkit
+LABEL org.opencontainers.image.title=eco-air-backend org.opencontainers.image.version=1.0.0 org.opencontainers.image.description=Procesamiento de alertas ambientales criticas student.id=898780
+ARG STUDENT_ID=898780
+ENTRYPOINT ["/__cacert_entrypoint.sh"]
+COPY --chmod=755 entrypoint.sh /__cacert_entrypoint.sh # buildkit
+RUN /bin/sh -c set -eux;     echo "Verifying install ...";     echo "java --version"; java --version;     echo "Complete." # buildkit
+RUN /bin/sh -c set -eux;     ARCH="$(apk --print-arch)";     case "${ARCH}" in        aarch64)          echo "Temurin ${JAVA_VERSION} binary for ${ARCH} is not available yet; retry after it is published upstream.";          exit 1;          ;;        x86_64)          ESUM='72423b1464907857f4e7ca854a2b8fd9f7cf6b9dd15bd3ea31ef6cf33b097aea';          BINARY_URL='https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jre_x64_alpine-linux_hotspot_17.0.20.1_1.tar.gz';          ;;        *)          echo "Unsupported arch: ${ARCH}";          exit 1;          ;;     esac;     wget -O /tmp/openjdk.tar.gz ${BINARY_URL};     wget -O /tmp/openjdk.tar.gz.sig ${BINARY_URL}.sig;     export GNUPGHOME="$(mktemp -d)";     gpg --batch --keyserver keyserver.ubuntu.com --recv-keys 3B04D753C9050D9A5D343F39843C48A565F8F04B;     gpg --batch --verify /tmp/openjdk.tar.gz.sig /tmp/openjdk.tar.gz;     rm -rf "${GNUPGHOME}" /tmp/openjdk.tar.gz.sig;     echo "${ESUM} */tmp/openjdk.tar.gz" | sha256sum -c -;     mkdir -p "$JAVA_HOME";     tar --extract         --file /tmp/openjdk.tar.gz         --directory "$JAVA_HOME"         --strip-components 1         --no-same-owner     ;     rm -f /tmp/openjdk.tar.gz; # buildkit
+ENV JAVA_VERSION=jdk-17.0.20.1+1
+RUN /bin/sh -c set -eux;     apk add --no-cache         fontconfig ttf-dejavu         gnupg         ca-certificates p11-kit-trust         musl-locales musl-locales-lang         tzdata         coreutils         openssl     ;     rm -rf /var/cache/apk/* # buildkit
+ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker run --rm --entrypoint sh eco-air-backend:1.0.0 -c 'echo OPERATOR_ID=$OPERATOR_ID'
+OPERATOR_ID=898780
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker inspect --format='{{.Id}}' eco-air-backend:1.0.0
+sha256:624afe985bc234de83b6d13a7b2e6889d659d71d6d60d93e23afb44dd298c1d3
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker inspect --format='{{json .RootFS.Layers}}' eco-air-backend:1.0.0
+["sha256:74d97c428c51a828f9051a7a40a53ff1fc99e54fc30323ce36760701b0b7f711","sha256:a152dfd2607b01e7c5b933b98da8c746ed0bd242e4f544ff3afd656fdfc7c7a1","sha256:b9398a5bcfd34ada6c3760ac870b064bf54fb191a502393cbb6a3088f8c9be5b","sha256:76b42b7b749e5cf63c4ef5fe61a878a5f508733d81f12305b29e6320007a49de","sha256:6c0c03120c42828b5d975a2b84e53a9ca0ed58b0b0dab9b6c79f5516ddabce2c","sha256:76a7bb53c5fe1c112145b66bd7601678ec05ec835d90e7aa64cd44601ab720ed","sha256:be852191e454bbb91ad2144248847492e08a3d0b3645aa4725d9b2a79fd0de33","sha256:3dc0171c77218aef32d7dc13a4d668f4551f56c37da940e950eab8ac323b12ef","sha256:5db987849d1bc6486d0d293464dcf77b4b3cf977c2ebfb0ed97208f9f45d5a96","sha256:24d141fb32fa16e252ec02dcd5a8b6855afb6c4e66436036d9db470551ab7d80"]
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker run --rm --entrypoint sh eco-air-backend:1.0.0 -c 'sha256sum /app/eco-air-backend.jar; ls -l /app'
+e41fd8864fef94019c75535249b74a0266fd258a7c6a9d6a04df7187b851346a  /app/eco-air-backend.jar
+total 100304
+-rw-r--r-- 1 sensor_user sensorgroup 49484478 Oct 20 21:02 eco-air-backend.jar
+-r--r--r-- 1 sensor_user sensorgroup 53219328 Oct 20 21:03 eco-air-backend.jsa
+[exit=0]
+
+===============================================================================
+  RETO 2.1 - VERIFICACION DEL DESACOPLAMIENTO DE CAPAS
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker history --human --format "table {{.Size}}\t{{.CreatedBy}}" eco-air-backend:1.0.0
+SIZE      CREATED BY
+0B        ENTRYPOINT ["sh" "-c" "exec java $JAVA_OPTS …
+0B        USER sensor_user
+0B        EXPOSE [8080/tcp]
+0B        ENV OPERATOR_ID=898780
+0B        ENV JAVA_OPTS=-XX:+UseContainerSupport -XX:M…
+103MB     RUN |1 STUDENT_ID=898780 /bin/sh -c chown -R…
+53.3MB    RUN |1 STUDENT_ID=898780 /bin/sh -c set -eux…
+0B        ENV CDS_ARCHIVE=/app/eco-air-backend.jsa
+49.5MB    COPY /build/target/eco-air-backend.jar /app/…
+8.19kB    WORKDIR /app
+32.8kB    RUN |1 STUDENT_ID=898780 /bin/sh -c addgroup…
+0B        LABEL org.opencontainers.image.title=eco-air…
+0B        ARG STUDENT_ID=898780
+0B        ENTRYPOINT ["/__cacert_entrypoint.sh"]
+12.3kB    COPY --chmod=755 entrypoint.sh /__cacert_ent…
+12.3kB    RUN /bin/sh -c set -eux;     echo "Verifying…
+141MB     RUN /bin/sh -c set -eux;     ARCH="$(apk --p…
+0B        ENV JAVA_VERSION=jdk-17.0.20.1+1
+44MB      RUN /bin/sh -c set -eux;     apk add --no-ca…
+0B        ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_AL…
+0B        ENV PATH=/opt/java/openjdk/bin:/usr/local/sb…
+0B        ENV JAVA_HOME=/opt/java/openjdk
+0B        CMD ["/bin/sh"]
+9.08MB    ADD alpine-minirootfs-3.24.2-x86_64.tar.gz /…
+[exit=0]
+
+===============================================================================
+  RETO 2.2 - INSPECCION DEL PROCESO DEL HOST (AISLAMIENTO DE PRIVILEGIOS)
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker run -d --name eco_air_active -p 8080:8080 eco-air-backend:1.0.0
+487301a25b85260887e5b5e93d53ef27240583f38cc55aae999aec54837ee118
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ sleep 12
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker top eco_air_active -o pid,user,comm
+PID                 USER                COMMAND
+653                 10001               java
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active ps -o pid,user,comm
+PID   USER     COMMAND
+    1 sensor_u java
+   29 sensor_u ps
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active id
+uid=10001(sensor_user) gid=10001(sensorgroup) groups=10001(sensorgroup)
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active env | grep OPERATOR_ID
+OPERATOR_ID=898780
+[exit=0]
+
+===============================================================================
+  RETO 2.3 - TEST DE PENETRACION (INMUTABILIDAD DE RUNTIME)
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active touch /etc/crontab_fake
+touch: cannot touch '/etc/crontab_fake': Permission denied
+[exit=1]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active ls -l /etc/crontab_fake
+ls: cannot access '/etc/crontab_fake': No such file or directory
+[exit=2]
+
+===============================================================================
+  RETO 2.4 - AUDITORIA DE ARTEFACTOS DE DESARROLLO
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active which mvn
+[exit=1]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active find / -name "*.java" 2>/dev/null
+[exit=1]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active ls -la /app
+total 100312
+drwxr-xr-x 1 sensor_user sensorgroup     4096 Oct 20 21:03 .
+drwxr-xr-x 1 root        root            4096 Oct 20 21:36 ..
+-rw-r--r-- 1 sensor_user sensorgroup 49484478 Oct 20 21:02 eco-air-backend.jar
+-r--r--r-- 1 sensor_user sensorgroup 53219328 Oct 20 21:03 eco-air-backend.jsa
+[exit=0]
+
+===============================================================================
+  RETO 3.1 - INDUCCION DEL COLAPSO POR MEMORIA (OOMKilled) - LIMITE 48 MB
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker run -d --name eco_air_crash -m 48m eco-air-backend:1.0.0
+8ca9d8a73f144f11c3da604496875d8d716e401e8ebc47a34ddcc02c1a614441
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ sleep 10
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker inspect eco_air_crash --format='Status: {{.State.Status}} | ExitCode: {{.State.ExitCode}} | OOMKilled: {{.State.OOMKilled}}'
+Status: running | ExitCode: 0 | OOMKilled: false
+[exit=0]
+
+>> El limite de 48 MB no alcanza: se espera al deceso efectivo y se vuelve a medir.
+
+user@eco-air-station:~/eco-air-backend$ docker inspect eco_air_crash --format='Status: {{.State.Status}} | ExitCode: {{.State.ExitCode}} | OOMKilled: {{.State.OOMKilled}}'
+Status: exited | ExitCode: 137 | OOMKilled: true
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker inspect eco_air_crash --format='MemoryLimit={{.HostConfig.Memory}} bytes'
+MemoryLimit=50331648 bytes
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker logs --timestamps --tail 20 eco_air_crash
+2026-10-20T21:37:08.953474112Z 
+2026-10-20T21:37:08.953524578Z   .   ____          _            __ _ _
+2026-10-20T21:37:08.954194334Z  /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+2026-10-20T21:37:08.954219681Z ( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+2026-10-20T21:37:08.954223546Z  \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+2026-10-20T21:37:08.954226639Z   '  |____| .__|_| |_|_| |_\__, | / / / /
+2026-10-20T21:37:08.954229526Z  =========|_|==============|___/=/_/_/_/
+2026-10-20T21:37:08.955842039Z  :: Spring Boot ::                (v3.2.5)
+2026-10-20T21:37:08.955870901Z 
+2026-10-20T21:37:09.650302438Z 2026-10-20T21:37:09.628Z  INFO 1 --- [eco-air-backend] [           main] com.ecoair.EcoAirApplication             : Starting EcoAirApplication v1.0.0 using Java 17.0.20.1 with PID 1 (/app/eco-air-backend.jar started by sensor_user in /app)
+2026-10-20T21:37:09.655571423Z 2026-10-20T21:37:09.654Z  INFO 1 --- [eco-air-backend] [           main] com.ecoair.EcoAirApplication             : No active profile set, falling back to 1 default profile: "default"
+2026-10-20T21:37:14.826631544Z 2026-10-20T21:37:14.769Z  INFO 1 --- [eco-air-backend] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Bootstrapping Spring Data JPA repositories in DEFAULT mode.
+2026-10-20T21:37:15.372329638Z 2026-10-20T21:37:15.367Z  INFO 1 --- [eco-air-backend] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Finished Spring Data repository scanning in 489 ms. Found 1 JPA repository interface.
+[exit=0]
+
+===============================================================================
+  RETO 3.2 - CALIBRACION ITERATIVA DEL LIMITE OPERATIVO MINIMO
+===============================================================================
+
+-------------------------------- LIMITE -m 96m --------------------------------
+    carga_host(loadavg1-5-15)=7.13 3.85 3.35
+>> tiempo_hasta_log_started=26s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 100663296 bytes
+Started EcoAirApplication in 29.084 seconds
+4f12a7c645d4   eco_air_cal   0.22%     95.89MiB / 96MiB    99.89%    872B / 126B   176MB / 190MB   30
+
+-------------------------------- LIMITE -m 128m --------------------------------
+    carga_host(loadavg1-5-15)=5.86 3.95 3.40
+>> tiempo_hasta_log_started=16s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 134217728 bytes
+Started EcoAirApplication in 15.797 seconds
+f70caeedebcf   eco_air_cal   0.60%     127.9MiB / 128MiB   99.91%    872B / 126B   6.96MB / 22.4MB   30
+
+-------------------------------- LIMITE -m 144m --------------------------------
+    carga_host(loadavg1-5-15)=5.39 3.97 3.42
+>> tiempo_hasta_log_started=16s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 150994944 bytes
+Started EcoAirApplication in 14.958 seconds
+64b1828382a0   eco_air_cal   0.31%     140MiB / 144MiB     97.25%    872B / 126B   0B / 0B     30
+
+-------------------------------- LIMITE -m 160m --------------------------------
+    carga_host(loadavg1-5-15)=6.09 4.24 3.52
+>> tiempo_hasta_log_started=14s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 167772160 bytes
+Started EcoAirApplication in 13.998 seconds
+3264422f7b81   eco_air_cal   0.20%     140.2MiB / 160MiB   87.61%    872B / 126B   0B / 0B     30
+
+-------------------------------- LIMITE -m 176m --------------------------------
+    carga_host(loadavg1-5-15)=5.48 4.25 3.55
+>> tiempo_hasta_log_started=14s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 184549376 bytes
+Started EcoAirApplication in 14.158 seconds
+136dca646f19   eco_air_cal   0.19%     141.2MiB / 176MiB   80.25%    872B / 126B   0B / 0B     30
+
+-------------------------------- LIMITE -m 192m --------------------------------
+    carga_host(loadavg1-5-15)=5.88 4.44 3.63
+>> tiempo_hasta_log_started=14s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 201326592 bytes
+Started EcoAirApplication in 13.659 seconds
+300735d1bb93   eco_air_cal   0.20%     141.5MiB / 192MiB   73.70%    872B / 126B   0B / 0B     30
+
+-------------------------------- LIMITE -m 256m --------------------------------
+    carga_host(loadavg1-5-15)=5.62 4.47 3.66
+>> tiempo_hasta_log_started=14s (vacio = no arranco dentro de la ventana)
+>> Status: running | ExitCode: 0 | OOMKilled: false | MemoryLimit: 268435456 bytes
+Started EcoAirApplication in 13.816 seconds
+84efb7ed7e7a   eco_air_cal   0.55%     146.1MiB / 256MiB   57.07%    872B / 126B   0B / 0B     30
+
+===============================================================================
+  RETO 3.2 - CONSOLIDACION DEL LIMITE CALIBRADO (192m) SOBRE eco_air_active
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker rm -f eco_air_active
+eco_air_active
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker run -d --name eco_air_active -m 192m -p 8080:8080 eco-air-backend:1.0.0
+ff291d57d049ee7c3f2a287097f7c76fe5bca02a9dde136478504c1ae954ee70
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ sleep 16
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker logs --timestamps eco_air_active | grep 'Started EcoAirApplication'
+2026-10-20T21:40:38.525976072Z 2026-10-20T21:40:38.525Z  INFO 1 --- [eco-air-backend] [           main] com.ecoair.EcoAirApplication             : Started EcoAirApplication in 13.565 seconds (process running for 14.9)
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker stats --no-stream eco_air_active
+CONTAINER ID   NAME             CPU %     MEM USAGE / LIMIT   MEM %     NET I/O         BLOCK I/O   PIDS
+ff291d57d049   eco_air_active   0.34%     141.6MiB / 192MiB   73.73%    1.17kB / 126B   0B / 0B     30
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ curl -s --max-time 60 -o /dev/null -w 'health (cold, dispara lazy-init): HTTP %{http_code} en %{time_total}s\n' http://localhost:8080/actuator/health
+health (cold, dispara lazy-init): HTTP 200 en 1.086267s
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ curl -s --max-time 15 -o /dev/null -w 'health (warm): HTTP %{http_code} en %{time_total}s\n' http://localhost:8080/actuator/health
+health (warm): HTTP 200 en 0.014392s
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ curl -s http://localhost:8080/actuator/health
+{"status":"UP","components":{"db":{"status":"UP","details":{"database":"H2","validationQuery":"isValid()"}},"diskSpace":{"status":"UP","details":{"total":762494443520,"free":719801647104,"threshold":10485760,"path":"/app/.","exists":true}},"ping":{"status":"UP"}}}[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ curl -s -X POST -H 'Content-Type: application/json' -d '{"stationId":"WS-01","pollutant":"PM2.5","concentration":412.7,"severity":"CRITICAL"}' http://localhost:8080/api/alerts
+{"id":1,"stationId":"WS-01","pollutant":"PM2.5","concentration":412.7,"severity":"CRITICAL","detectedAt":"2026-10-20T21:40:43.398955957Z"}[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ curl -s http://localhost:8080/api/alerts
+[{"id":1,"stationId":"WS-01","pollutant":"PM2.5","concentration":412.7,"severity":"CRITICAL","detectedAt":"2026-10-20T21:40:43.398956Z"}][exit=0]
+
+===============================================================================
+  TABLA DE IDENTIDAD FINAL
+===============================================================================
+
+user@eco-air-station:~/eco-air-backend$ docker inspect --format='{{.Id}}' eco-air-backend:1.0.0
+sha256:624afe985bc234de83b6d13a7b2e6889d659d71d6d60d93e23afb44dd298c1d3
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active env | grep OPERATOR_ID
+OPERATOR_ID=898780
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker exec eco_air_active id
+uid=10001(sensor_user) gid=10001(sensorgroup) groups=10001(sensorgroup)
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker stats --no-stream eco_air_active
+CONTAINER ID   NAME             CPU %     MEM USAGE / LIMIT   MEM %     NET I/O           BLOCK I/O     PIDS
+ff291d57d049   eco_air_active   0.18%     155.8MiB / 192MiB   81.14%    4.15kB / 3.64kB   12.3kB / 0B   30
+[exit=0]
+
+user@eco-air-station:~/eco-air-backend$ docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+NAMES            IMAGE                   STATUS                       PORTS
+eco_air_active   eco-air-backend:1.0.0   Up 23 seconds                0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+eco_air_crash    eco-air-backend:1.0.0   Exited (137) 3 minutes ago   
+[exit=0]
+
+======================= FIN DE LA SESION DE AUDITORIA =========================
+
+Script terminado en 2026-10-20 16:40:46-05:00 [CÓDIGO_SALIDA_ORDEN="0"]
